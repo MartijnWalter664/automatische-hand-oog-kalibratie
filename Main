@@ -1,0 +1,440 @@
+
+#include <HalconCpp.h>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <array>
+#include <sstream>
+#include <iomanip>
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <k4a/k4a.h>
+
+#include "Cobot.cpp"
+#include "Pointcloud.cpp"
+
+//laat cobot bewegen naar voorgeprogrameerde punt
+/*	int u = i--;
+    cobotController->startCobot(cobot_poses[u]);*/
+    /*std::unique_ptr<CobotController> cobotController;*/
+
+        //pointcloud maken
+
+const char* output_directory = "C:/Users/marti/cobot aansturing/fotos 3d camera voor halcon";
+static void create_xy_table(const k4a_calibration_t* calibration, k4a_image_t xy_table)
+{
+    k4a_float2_t* table_data = (k4a_float2_t*)(void*)k4a_image_get_buffer(xy_table);
+
+    int width = calibration->depth_camera_calibration.resolution_width;
+    int height = calibration->depth_camera_calibration.resolution_height;
+
+    k4a_float2_t p;
+    k4a_float3_t ray;
+    int valid;
+
+    for (int y = 0, idx = 0; y < height; y++)
+    {
+        p.xy.y = (float)y;
+        for (int x = 0; x < width; x++, idx++)
+        {
+            p.xy.x = (float)x;
+
+            k4a_calibration_2d_to_3d(
+                calibration, &p, 1.f, K4A_CALIBRATION_TYPE_DEPTH, K4A_CALIBRATION_TYPE_DEPTH, &ray, &valid);
+
+            if (valid)
+            {
+                table_data[idx].xy.x = ray.xyz.x;
+                table_data[idx].xy.y = ray.xyz.y;
+            }
+            else
+            {
+                table_data[idx].xy.x = nanf("");
+                table_data[idx].xy.y = nanf("");
+            }
+        }
+    }
+}
+
+static void generate_point_cloud(const k4a_image_t depth_image,
+    const k4a_image_t xy_table,
+    k4a_image_t point_cloud,
+    int* point_count)
+{
+    int width = k4a_image_get_width_pixels(depth_image);
+    int height = k4a_image_get_height_pixels(depth_image);
+
+    uint16_t* depth_data = (uint16_t*)(void*)k4a_image_get_buffer(depth_image);
+    k4a_float2_t* xy_table_data = (k4a_float2_t*)(void*)k4a_image_get_buffer(xy_table);
+    k4a_float3_t* point_cloud_data = (k4a_float3_t*)(void*)k4a_image_get_buffer(point_cloud);
+
+    *point_count = 0;
+    for (int i = 0; i < width * height; i++)
+    {
+        if (depth_data[i] != 0 && !isnan(xy_table_data[i].xy.x) && !isnan(xy_table_data[i].xy.y))
+        {
+            point_cloud_data[i].xyz.x = xy_table_data[i].xy.x * (float)depth_data[i];
+            point_cloud_data[i].xyz.y = xy_table_data[i].xy.y * (float)depth_data[i];
+            point_cloud_data[i].xyz.z = (float)depth_data[i];
+            (*point_count)++;
+        }
+        else
+        {
+            point_cloud_data[i].xyz.x = nanf("");
+            point_cloud_data[i].xyz.y = nanf("");
+            point_cloud_data[i].xyz.z = nanf("");
+        }
+    }
+}
+
+static void write_point_cloud(const char* output_directory, const k4a_image_t point_cloud, int point_count)
+{
+    int width = k4a_image_get_width_pixels(point_cloud);
+    int height = k4a_image_get_height_pixels(point_cloud);
+
+    k4a_float3_t* point_cloud_data = (k4a_float3_t*)(void*)k4a_image_get_buffer(point_cloud);
+
+    // save to the ply file
+    std::ofstream ofs(output_directory); // text mode first
+    ofs << "ply" << std::endl;
+    ofs << "format ascii 1.0" << std::endl;
+    ofs << "element vertex"
+        << " " << point_count << std::endl;
+    ofs << "property float x" << std::endl;
+    ofs << "property float y" << std::endl;
+    ofs << "property float z" << std::endl;
+    ofs << "end_header" << std::endl;
+    ofs.close();
+
+    std::stringstream ss;
+    for (int i = 0; i < width * height; i++)
+    {
+        if (isnan(point_cloud_data[i].xyz.x) || isnan(point_cloud_data[i].xyz.y) || isnan(point_cloud_data[i].xyz.z))
+        {
+            continue;
+        }
+
+        ss << (float)point_cloud_data[i].xyz.x << " " << (float)point_cloud_data[i].xyz.y << " "
+            << (float)point_cloud_data[i].xyz.z << std::endl;
+    }
+
+    std::ofstream ofs_text(output_directory, std::ios::out | std::ios::app);
+    ofs_text.write(ss.str().c_str(), (std::streamsize)ss.str().length());
+}
+
+        std::array<std::array<double, 6>, 8> cobot_poses = { {
+        {-0.739, -0.277, 0.325, 2.440, 3.009, 0.975}, // Pose 1
+        {-0.646, -0.203, 0.300, 1.820, 3.134, 1.210}, // Pose 2
+        {-0.579, -0.097, 0.308, 1.445, 3.290, 1.579}, // Pose 3
+        {-0.587, 0.012, 0.317, 0.137, 3.938, 1.090}, // Pose 4
+        { -0.685, 0.146, 0.324, 0.438, -1.975, -0.380}, // Pose 5
+        {-0.751, 0.200, 0.284, 0.967, -2.008, 0.328}, // Pose 6
+        {-0.885, 0.201, 0.287, 1.220, -1.309, 0.251}, // Pose 7
+        {-1.008, 0.208, 0.235, 1.246, -0.888, 0.252}  // Pose 8
+        } };
+
+        namespace beast = boost::beast;  // Alias for convenience
+        namespace net = boost::asio;    // Alias for convenience
+        using tcp = net::ip::tcp;
+        using namespace HalconCpp;
+
+        void send_command(const std::string& host, int port, const std::string& command) {
+            try {
+                // I/O context opzetten
+                net::io_context io_context;
+
+                // Resolver instellen voor het IP en de poort
+                tcp::resolver resolver(io_context);
+                auto endpoints = resolver.resolve(host, std::to_string(port));
+
+                // Socket instellen
+                tcp::socket socket(io_context);
+
+                // Verbinden met de cobot
+                net::connect(socket, endpoints);
+
+                // Commando naar de cobot sturen
+                net::write(socket, net::buffer(command));
+
+                std::cout << "Commando verzonden naar " << host << ":" << port << "\n";
+
+                // Optioneel: reactie van de cobot lezen (indien relevant)
+                std::vector<char> buffer(1024);
+                size_t bytes_received = socket.read_some(net::buffer(buffer));
+                /*std::cout << "Reactie van cobot: " << std::string(buffer.data(), bytes_received) << "\n";*/
+
+                // Socket sluiten
+                socket.close();
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Fout: " << e.what() << std::endl;
+            }
+        }
+
+        int main(int argc, char** argv) {
+            // Close any existing connection
+            try {
+                const std::string host = "192.168.0.66";
+                const int port = 30003;
+
+                // Set up I/O context and a TCP socket
+                net::io_context ioc;
+                tcp::socket socket(ioc);
+
+                // Connect or bind the socket here (example only)
+                tcp::resolver resolver(ioc);
+                auto const results = resolver.resolve("example.com", "80");
+                net::connect(socket, results);
+
+                socket.close();
+                // Parameters voor de bol
+
+                float sphere[7] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }; // Middelpunt
+                HTuple bal = HTuple(sphere, 7);
+
+                HTuple empty;
+                HTuple SphereOM3D;
+                HTuple SphereOM3D2;
+                HTuple SphereSurfaceModelID;
+                HTuple SampledModel;
+                HTuple Balls;
+                HTuple status;
+                HTuple GenParamValue;
+                HTuple Pose;
+                HTuple score;
+                HTuple nul = HTuple(0.0);
+                HTuple Objectmodel3D;
+                HTuple Objectmodel3D2;
+                HTuple Objectmodel3D3;
+                HTuple Objectmodel3D4;
+                HTuple Objectmodel3D5;
+                HTuple SurfaceMatchingResultID;
+                HTuple Window;
+                HTuple CamParam;
+                HTuple OutputCalib;
+
+                //std::string directory = "C:/Users/marti/cobot aansturing/fotos 3d camera voor halcon/output"; //voor testen
+                std::string directory = "C:/Users/marti/cobot aansturing/fotos 3d camera voor halcon/output.ply"; //voor demo opstelling
+                std::string pingpong = "C:/Users/marti/cobot aansturing/fotos 3d camera voor halcon/output";
+                std::string extension = ".ply";
+                std::string final;
+
+                // Genereer de bol voor surface based matching
+                GenSphereObjectModel3d(bal, 0.015, &SphereOM3D);
+                ConvexHullObjectModel3d(SphereOM3D, &SphereOM3D2);
+                CreateSurfaceModel(SphereOM3D2, 0.03, empty, empty, &SphereSurfaceModelID);
+                GetSurfaceModelParam(SphereSurfaceModelID, "sampled_model", &SampledModel);
+
+
+                //array voor uitkomst surface matching
+                const int size = 8;
+                float x[size];
+                float y[size];
+                float z[size];
+
+                
+
+                PointcloudController pointcloudController;
+               
+
+                for (int i = 0; i < 8; i++) {
+
+                    //laat cobot bewegen naar voorgeprogrameerde punt
+
+                    const auto& pose = cobot_poses[i];
+
+                    // Commando genereren
+                    std::ostringstream cmd;
+                    cmd << std::fixed << std::setprecision(6)
+                        << "movej(p["
+                        << pose[0] << ", " << pose[1] << ", " << pose[2] << ", "
+                        << pose[3] << ", " << pose[4] << ", " << pose[5]
+                        << "], a=1.0, v=1.5, r=0.01)\n";
+                    // Verzenden naar de cobot
+                    // 
+                    send_command(host, port, cmd.str());
+                    // Wachten tussen bewegingen (indien nodig)
+                    std::this_thread::sleep_for(std::chrono::seconds(2)); // Wacht 2 seconden
+                
+                 //   sla cobot posities op (cobot base >> cobot TCP)
+
+                    //maak pointcloud en sla deze op als "pingpongi.ply"
+                  /* final = directory + std::to_string(i) + extension;*/
+                   int returnCode = 1;
+                   k4a_device_t device = NULL;
+                   const int32_t TIMEOUT_IN_MS = 1000;
+                   k4a_capture_t capture = NULL;
+                   std::string file_name;
+                   uint32_t device_count = 0;
+                   k4a_device_configuration_t config = K4A_DEVICE_CONFIG_INIT_DISABLE_ALL;
+                   k4a_image_t depth_image = NULL;
+                   k4a_image_t xy_table = NULL;
+                   k4a_image_t point_cloud = NULL;
+                   int point_count = 0;
+
+                   if (argc != 2)
+                   {
+                       printf("fastpointcloud.exe <output file>\n");
+                       returnCode = 2;
+                       goto Exit;
+                   }
+
+                   file_name = argv[1];
+
+                   device_count = k4a_device_get_installed_count();
+
+                   if (device_count == 0)
+                   {
+                       printf("No K4A devices found\n");
+                       return 0;
+                   }
+
+                   if (K4A_RESULT_SUCCEEDED != k4a_device_open(K4A_DEVICE_DEFAULT, &device))
+                   {
+                       printf("Failed to open device\n");
+                       goto Exit;
+                   }
+
+                   config.depth_mode = K4A_DEPTH_MODE_WFOV_2X2BINNED;
+                   config.camera_fps = K4A_FRAMES_PER_SECOND_30;
+
+                   k4a_calibration_t calibration;
+                   if (K4A_RESULT_SUCCEEDED !=
+                       k4a_device_get_calibration(device, config.depth_mode, config.color_resolution, &calibration))
+                   {
+                       printf("Failed to get calibration\n");
+                       goto Exit;
+                   }
+
+                   k4a_image_create(K4A_IMAGE_FORMAT_CUSTOM,
+                       calibration.depth_camera_calibration.resolution_width,
+                       calibration.depth_camera_calibration.resolution_height,
+                       calibration.depth_camera_calibration.resolution_width * (int)sizeof(k4a_float2_t),
+                       &xy_table);
+
+                   create_xy_table(&calibration, xy_table);
+
+                   k4a_image_create(K4A_IMAGE_FORMAT_CUSTOM,
+                       calibration.depth_camera_calibration.resolution_width,
+                       calibration.depth_camera_calibration.resolution_height,
+                       calibration.depth_camera_calibration.resolution_width * (int)sizeof(k4a_float3_t),
+                       &point_cloud);
+
+                   if (K4A_RESULT_SUCCEEDED != k4a_device_start_cameras(device, &config))
+                   {
+                       printf("Failed to start cameras\n");
+                       goto Exit;
+                   }
+
+                   // Get a capture
+                   switch (k4a_device_get_capture(device, &capture, TIMEOUT_IN_MS))
+                   {
+                   case K4A_WAIT_RESULT_SUCCEEDED:
+                       break;
+                   case K4A_WAIT_RESULT_TIMEOUT:
+                       printf("Timed out waiting for a capture\n");
+                       goto Exit;
+                   case K4A_WAIT_RESULT_FAILED:
+                       printf("Failed to read a capture\n");
+                       goto Exit;
+                   }
+
+                   // Get a depth image
+                   depth_image = k4a_capture_get_depth_image(capture);
+                   if (depth_image == 0)
+                   {
+                       printf("Failed to get depth image from capture\n");
+                       goto Exit;
+                   }
+
+                   generate_point_cloud(depth_image, xy_table, point_cloud, &point_count);
+
+                   write_point_cloud(file_name.c_str(), point_cloud, point_count);
+
+                   k4a_image_release(depth_image);
+                   k4a_capture_release(capture);
+                   k4a_image_release(xy_table);
+                   k4a_image_release(point_cloud);
+
+                   returnCode = 0;
+               Exit:
+                   if (device != NULL)
+                   {
+                       k4a_device_close(device);
+                   }
+
+                    pointcloudController.createPointcloud(pingpong);
+
+                    //laad en filter cobot scene die net gemaakt is 
+                    int u = i + 1 ;
+                    char filenamechar[1024];
+                    //final = directory + std::to_string(u) + extension; //voor testen
+                    final = directory; // voor demo opstelling
+                    strcpy_s(filenamechar, final.c_str());
+                    // filter xyz 
+                    ReadObjectModel3d(filenamechar, "mm", empty, empty, &Balls, &status);
+                    SelectPointsObjectModel3d(Balls, "point_coord_z", 0.2, 0.6, &Objectmodel3D);
+                    SelectPointsObjectModel3d(Objectmodel3D, "point_coord_x", -0.6, 0.6, &Objectmodel3D2);
+                    SelectPointsObjectModel3d(Objectmodel3D2, "point_coord_y", -0.38, 0.28, &Objectmodel3D3);
+                    // filter op punten 
+                    ConnectionObjectModel3d(Objectmodel3D3, "distance_3d", 0.004, &Objectmodel3D4);
+                    GetObjectModel3dParams(Objectmodel3D4, "num_points", &GenParamValue);
+                    SelectObjectModel3d(Objectmodel3D4, "num_points", "and", 165, 430, &Objectmodel3D5);
+                    if (Objectmodel3D5.Length() > 1) {
+                        Objectmodel3D5 = Objectmodel3D5[0];
+                    }
+                    
+                    //surface based matching
+                    FindSurfaceModel(SphereSurfaceModelID, Objectmodel3D5, 0.05, 0.2, 0, "false", "num_matches", 1, &Pose, &score, &SurfaceMatchingResultID);
+
+                    
+                    x[i] = Pose[0]; // Sla waarden op 
+                    y[i] = Pose[1];
+                    z[i] = Pose[2];
+
+                }
+                int q = 0;
+                for (int o = 0; o < 8; ++o) {
+                    q++;
+                    std::cout << "Pose: " << q << std::endl;
+                    std::cout << "X = " << x[o] << std::endl;
+                    std::cout << "Y = " << y[o] << std::endl;
+                    std::cout << "Z = " << z[o] << std::endl;
+                }
+
+                //array van bal posities in htuple zetten voor halcon verwerking
+                HTuple Balx = HTuple(x, 8);
+                HTuple Baly = HTuple(y, 8);
+                HTuple Balz = HTuple(z, 8);
+               
+                ////TCP positie van voorgeprogrameerde punten 
+                float tcpx[size] = { -0.765, -0.716, -0.670, -0.725, -0.807, -0.842, -0.880, -0.947};
+                HTuple TCPx = HTuple(tcpx, 8);
+
+                float tcpy[size] = { -0.139, -0.077, -0.025, 0.020, 0.086, 0.089, 0.080, 0.104 };
+                HTuple TCPy = HTuple(tcpy, 8);
+
+                float tcpz[size] = { 0.403, 0.372, 0.400, 0.400, 0.410, 0.358, 0.392, 0.341};
+                HTuple TCPz = HTuple(tcpz, 8);
+
+                //calibratie uitvoeren 
+                VectorToHomMat3d("rigid", Balx, Baly, Balz, TCPx, TCPy, TCPz, &OutputCalib);
+                // print volledige calib
+                std::cout << "Calibratie: " << OutputCalib.ToString().Text() << std::endl;
+                float CalibPose[3] = { OutputCalib[3], OutputCalib[7], OutputCalib[11] };
+
+              // print de waardevolle punten 
+                    std::cout << "CalibX = " << CalibPose[0] << std::endl;
+                    std::cout << "CalibY = " << CalibPose[1] << std::endl;
+                    std::cout << "CalibZ = " << CalibPose[2] << std::endl;
+
+            }
+            catch (HException& e) {
+                // Foutafhandeling
+                std::cerr << "Fout: " << e.ErrorMessage().Text() << std::endl;
+            }
+
+            return 0;
+        }
